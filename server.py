@@ -1395,24 +1395,24 @@ async def startup():
                 supabase.auth.admin.list_users()
             )
         )
-    # Check if admin exists by email in users list
-    admin_exists = any(user['email'] == ADMIN_EMAIL for user in (r.users or []))
-    if not admin_exists:
-        auth_result = await asyncio.to_thread(
-            supabase.auth.admin.create_user,
-            {
-                "email": ADMIN_EMAIL,
-                "password": ADMIN_PASSWORD,
-                "email_confirm": True,
-                "user_metadata": {"name": "Kovon Founders", "role": "admin"},
-            },
-        )
-        if auth_result.user:
-            logger.info(f"Admin user created: {ADMIN_EMAIL}")
+        # Check if admin exists by email in users list
+        admin_exists = any(user['email'] == ADMIN_EMAIL for user in (r.users or []))
+        if not admin_exists:
+            auth_result = await asyncio.to_thread(
+                supabase.auth.admin.create_user,
+                {
+                    "email": ADMIN_EMAIL,
+                    "password": ADMIN_PASSWORD,
+                    "email_confirm": True,
+                    "user_metadata": {"name": "Kovon Founders", "role": "admin"},
+                },
+            )
+            if auth_result.user:
+                logger.info(f"Admin user created: {ADMIN_EMAIL}")
+            else:
+                logger.warning(f"Failed to create admin user: {ADMIN_EMAIL}")
         else:
-            logger.warning(f"Failed to create admin user: {ADMIN_EMAIL}")
-    else:
-        logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
+            logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
     except Exception as e:
         logger.error(f"Startup admin setup error: {e}")
 
