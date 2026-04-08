@@ -1057,7 +1057,7 @@ async def admin_unblock_user(user_id: str, user: dict = Depends(get_admin_user))
         raise HTTPException(status_code=404, detail="User not found")
     await _sb(
         lambda: (
-            supabase.table("users")
+            supabase.table("profiles")
             .update({"is_blocked": False})
             .eq("id", user_id)
             .execute()
@@ -1392,32 +1392,27 @@ async def startup():
     try:
         r = await _sb(
             lambda: (
-                supabase.table("users").select("id").eq("email", ADMIN_EMAIL).execute()
+                supabase.auth.admin.list_users()
             )
         )
-        if not r.data:
-            auth_result = await asyncio.to_thread(
-                supabase.auth.admin.create_user,
-                {
-                    "email": ADMIN_EMAIL,
-                    "password": ADMIN_PASSWORD,
-                    "email_confirm": True,
-                    "user_metadata": {"name": "Kovon Founders"},
-                },
-            )
-            if auth_result.user:
-                uid = str(auth_result.user.id)
-                await _sb(
-                    lambda: (
-                        supabase.table("users")
-                        .update({"role": "admin", "is_verified": True})
-                        .eq("id", uid)
-                        .execute()
-                    )
-                )
-                logger.info(f"Admin user created: {ADMIN_EMAIL}")
+    # Check if admin exists by email in users list
+    admin_exists = any(user['email'] == ADMIN_EMAIL for user in (r.users or []))
+    if not admin_exists:
+        auth_result = await asyncio.to_thread(
+            supabase.auth.admin.create_user,
+            {
+                "email": ADMIN_EMAIL,
+                "password": ADMIN_PASSWORD,
+                "email_confirm": True,
+                "user_metadata": {"name": "Kovon Founders", "role": "admin"},
+            },
+        )
+        if auth_result.user:
+            logger.info(f"Admin user created: {ADMIN_EMAIL}")
         else:
-            logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
+            logger.warning(f"Failed to create admin user: {ADMIN_EMAIL}")
+    else:
+        logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
     except Exception as e:
         logger.error(f"Startup admin setup error: {e}")
 
