@@ -5,12 +5,10 @@ load_dotenv()
 import asyncio
 import logging
 import os
-import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import bcrypt
 import jwt
 import resend
 from fastapi import (
@@ -32,12 +30,11 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-resend.api_key = os.environ.get("RESEND_API_KEY", "")
+resend.api_key = os.environ.get("RESEND_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8001")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-JWT_SECRET = os.environ.get("JWT_SECRET", "fallback_secret")
-JWT_ALGORITHM = "HS256"
+BACKEND_URL = os.environ.get("BACKEND_URL")
+FRONTEND_URL = os.environ.get("FRONTEND_URL")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "founders@kovon.io")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "KovonAdmin@2026")
 
@@ -114,25 +111,6 @@ def _norm_list(rows) -> list:
 
 
 # ── Auth Utilities ─────────────────────────────────────────────────────────
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-
-
-def create_access_token(user_id: str, email: str, role: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "role": role,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
-        "type": "access",
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
 async def get_current_user(request: Request) -> dict:
     token = None
     auth_header = request.headers.get("Authorization", "")
@@ -141,18 +119,22 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user_id = payload["sub"]
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},  # Supabase uses "authenticated"
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
         r = await _sb(
-            lambda: supabase.table("users").select("*").eq("id", user_id).execute()
+            lambda: supabase.table("profiles").select("*").eq("id", user_id).execute()
         )
         if not r.data:
             raise HTTPException(status_code=401, detail="User not found")
         user = r.data[0]
         user["_id"] = user["id"]
-        user.pop("password_hash", None)
         if user.get("is_blocked", False):
             raise HTTPException(
                 status_code=403,
@@ -308,10 +290,6 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
-class ResendVerificationRequest(BaseModel):
-    email: EmailStr
-
-
 # ── Auth Routes ────────────────────────────────────────────────────────────
 @api_router.post("/auth/register")
 async def register(req: RegisterRequest):
@@ -321,51 +299,40 @@ async def register(req: RegisterRequest):
             status_code=400,
             detail="Only @kovon.io email addresses are allowed to register",
         )
-    r = await _sb(
-        lambda: supabase.table("users").select("id").eq("email", email).execute()
-    )
-    if r.data:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    role = "admin" if email == ADMIN_EMAIL else "user"
-    is_admin = email == ADMIN_EMAIL
-    now = datetime.now(timezone.utc)
-    user_doc = {
-        "email": email,
-        "name": req.name,
-        "role": role,
-        "password_hash": hash_password(req.password),
-        "created_at": now.isoformat(),
-        "is_verified": is_admin,
-        "is_blocked": False,
-    }
-    r = await _sb(lambda: supabase.table("users").insert(user_doc).execute())
-    if not r.data:
-        raise HTTPException(status_code=500, detail="Failed to create user")
-    user_id = r.data[0]["id"]
-    if not is_admin:
-        token = secrets.token_urlsafe(32)
-        token_doc = {
-            "token": token,
-            "user_id": user_id,
-            "email": email,
-            "created_at": now.isoformat(),
-            "expires_at": (now + timedelta(hours=24)).isoformat(),
-            "used": False,
-        }
+    try:
+        result = await asyncio.to_thread(
+            supabase.auth.sign_up,
+            {
+                "email": email,
+                "password": req.password,
+                "options": {
+                    "data": {"name": req.name},
+                    "email_redirect_to": f"{FRONTEND_URL}/login?verified=true",
+                },
+            },
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "already registered" in msg or "already been registered" in msg:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail=f"Registration failed: {e}")
+
+    if not result.user:
+        raise HTTPException(status_code=400, detail="Registration failed")
+
+    # If admin email, promote role immediately
+    if email == ADMIN_EMAIL:
+        uid = str(result.user.id)
         await _sb(
             lambda: (
-                supabase.table("email_verification_tokens").insert(token_doc).execute()
+                supabase.auth.admin.update_user_by_id(uid, {"user_metadata": {"role": "admin"}})
+                .execute()
             )
         )
-        verify_url = f"{BACKEND_URL}/api/auth/verify-email/{token}"
-        await send_email(
-            to=email,
-            subject="Verify your Kovon Document Registry account",
-            html=build_verification_email(verify_url),
-        )
+
     return {
         "message": "Registration successful. Please check your email to verify your account.",
-        "needs_verification": not is_admin,
+        "needs_verification": True,
     }
 
 
@@ -376,29 +343,41 @@ async def login(req: LoginRequest):
         raise HTTPException(
             status_code=400, detail="Only @kovon.io email addresses are allowed"
         )
-    r = await _sb(
-        lambda: supabase.table("users").select("*").eq("email", email).execute()
-    )
-    user = r.data[0] if r.data else None
-    if not user or not verify_password(req.password, user["password_hash"]):
+    try:
+        result = await asyncio.to_thread(
+            supabase.auth.sign_in_with_password,
+            {"email": email, "password": req.password},
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "email not confirmed" in msg:
+            raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not user.get("is_verified", True):
-        raise HTTPException(status_code=403, detail="EMAIL_NOT_VERIFIED")
-    if user.get("is_blocked", False):
+
+    if not result.user or not result.session:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    user_id = str(result.user.id)
+    r = await _sb(
+        lambda: supabase.table("profiles").select("*").eq("id", user_id).execute()
+    )
+    if not r.data:
+        raise HTTPException(status_code=401, detail="User profile not found")
+
+    profile = r.data[0]
+    if profile.get("is_blocked", False):
         raise HTTPException(
             status_code=403,
             detail="Your account has been blocked. Please contact the administrator.",
         )
-    user_id = user["id"]
-    role = user.get("role", "user")
-    token = create_access_token(user_id, email, role)
+
     return {
-        "token": token,
+        "token": result.session.access_token,
         "user": {
             "id": user_id,
             "email": email,
-            "name": user.get("name", ""),
-            "role": role,
+            "name": profile.get("name", ""),
+            "role": profile.get("role", "user"),
         },
     }
 
@@ -408,129 +387,18 @@ async def me(user: dict = Depends(get_current_user)):
     return user
 
 
-# ── Email Verification ────────────────────────────────────────────────────
-@api_router.get("/auth/verify-email/{token}")
-async def verify_email(token: str):
-    r = await _sb(
-        lambda: (
-            supabase.table("email_verification_tokens")
-            .select("*")
-            .eq("token", token)
-            .execute()
-        )
-    )
-    if not r.data:
-        return RedirectResponse(f"{FRONTEND_URL}/login?verified=error")
-    token_doc = r.data[0]
-    if token_doc.get("used"):
-        return RedirectResponse(f"{FRONTEND_URL}/login?verified=error")
-    expires_at = datetime.fromisoformat(token_doc["expires_at"])
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) > expires_at:
-        return RedirectResponse(f"{FRONTEND_URL}/login?verified=expired")
-    uid = token_doc["user_id"]
-    await _sb(
-        lambda: (
-            supabase.table("users")
-            .update({"is_verified": True})
-            .eq("id", uid)
-            .execute()
-        )
-    )
-    await _sb(
-        lambda: (
-            supabase.table("email_verification_tokens")
-            .update({"used": True})
-            .eq("token", token)
-            .execute()
-        )
-    )
-    return RedirectResponse(f"{FRONTEND_URL}/login?verified=true")
-
-
-@api_router.post("/auth/resend-verification")
-async def resend_verification(req: ResendVerificationRequest):
-    email = req.email.lower().strip()
-    r = await _sb(
-        lambda: supabase.table("users").select("*").eq("email", email).execute()
-    )
-    user = r.data[0] if r.data else None
-    if user and not user.get("is_verified", True):
-        uid = user["id"]
-        await _sb(
-            lambda: (
-                supabase.table("email_verification_tokens")
-                .delete()
-                .eq("user_id", uid)
-                .eq("used", False)
-                .execute()
-            )
-        )
-        token = secrets.token_urlsafe(32)
-        now = datetime.now(timezone.utc)
-        token_doc = {
-            "token": token,
-            "user_id": uid,
-            "email": email,
-            "created_at": now.isoformat(),
-            "expires_at": (now + timedelta(hours=24)).isoformat(),
-            "used": False,
-        }
-        await _sb(
-            lambda: (
-                supabase.table("email_verification_tokens").insert(token_doc).execute()
-            )
-        )
-        verify_url = f"{BACKEND_URL}/api/auth/verify-email/{token}"
-        await send_email(
-            to=email,
-            subject="Verify your Kovon Document Registry account",
-            html=build_verification_email(verify_url),
-        )
-    return {
-        "message": "If your account exists and is unverified, a new verification email has been sent."
-    }
-
-
 # ── Forgot / Reset Password ───────────────────────────────────────────────
 @api_router.post("/auth/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest):
     email = req.email.lower().strip()
-    r = await _sb(
-        lambda: supabase.table("users").select("*").eq("email", email).execute()
-    )
-    user = r.data[0] if r.data else None
-    if user:
-        uid = user["id"]
-        await _sb(
-            lambda: (
-                supabase.table("password_reset_tokens")
-                .delete()
-                .eq("user_id", uid)
-                .eq("used", False)
-                .execute()
-            )
+    try:
+        await asyncio.to_thread(
+            supabase.auth.reset_password_for_email,
+            email,
+            {"redirect_to": f"{FRONTEND_URL}/reset-password"},
         )
-        token = secrets.token_urlsafe(32)
-        now = datetime.now(timezone.utc)
-        token_doc = {
-            "token": token,
-            "user_id": uid,
-            "email": email,
-            "created_at": now.isoformat(),
-            "expires_at": (now + timedelta(hours=1)).isoformat(),
-            "used": False,
-        }
-        await _sb(
-            lambda: supabase.table("password_reset_tokens").insert(token_doc).execute()
-        )
-        reset_url = f"{FRONTEND_URL}/reset-password?token={token}"
-        await send_email(
-            to=email,
-            subject="Reset your Kovon Document Registry password",
-            html=build_reset_email(reset_url),
-        )
+    except Exception:
+        pass  # Never reveal whether email exists
     return {
         "message": "If that email is registered, a password reset link has been sent."
     }
@@ -538,49 +406,35 @@ async def forgot_password(req: ForgotPasswordRequest):
 
 @api_router.post("/auth/reset-password")
 async def reset_password(req: ResetPasswordRequest):
-    r = await _sb(
-        lambda: (
-            supabase.table("password_reset_tokens")
-            .select("*")
-            .eq("token", req.token)
-            .execute()
-        )
-    )
-    if not r.data:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
-    token_doc = r.data[0]
-    if token_doc.get("used"):
-        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
-    expires_at = datetime.fromisoformat(token_doc["expires_at"])
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) > expires_at:
-        raise HTTPException(
-            status_code=400, detail="Reset link has expired. Please request a new one."
-        )
     if len(req.new_password) < 6:
         raise HTTPException(
             status_code=400, detail="Password must be at least 6 characters"
         )
-    uid = token_doc["user_id"]
-    new_hash = hash_password(req.new_password)
-    req_token = req.token
-    await _sb(
-        lambda: (
-            supabase.table("users")
-            .update({"password_hash": new_hash})
-            .eq("id", uid)
-            .execute()
+    try:
+        payload = jwt.decode(
+            req.token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
         )
-    )
-    await _sb(
-        lambda: (
-            supabase.table("password_reset_tokens")
-            .update({"used": True})
-            .eq("token", req_token)
-            .execute()
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid reset token")
+        await asyncio.to_thread(
+            supabase.auth.admin.update_user_by_id,
+            user_id,
+            {"password": req.new_password},
         )
-    )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=400, detail="Reset link has expired. Please request a new one."
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Password reset failed: {e}")
     return {
         "message": "Password reset successfully. You can now sign in with your new password."
     }
@@ -590,26 +444,27 @@ async def reset_password(req: ResetPasswordRequest):
 async def change_password(
     req: ChangePasswordRequest, user: dict = Depends(get_current_user)
 ):
-    uid = user["id"]
-    r = await _sb(lambda: supabase.table("users").select("*").eq("id", uid).execute())
-    if not r.data:
-        raise HTTPException(status_code=404, detail="User not found")
-    user_doc = r.data[0]
-    if not verify_password(req.current_password, user_doc["password_hash"]):
+    email = user["email"]
+    # Verify current password by attempting sign-in
+    try:
+        await asyncio.to_thread(
+            supabase.auth.sign_in_with_password,
+            {"email": email, "password": req.current_password},
+        )
+    except Exception:
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(req.new_password) < 6:
         raise HTTPException(
             status_code=400, detail="New password must be at least 6 characters"
         )
-    new_hash = hash_password(req.new_password)
-    await _sb(
-        lambda: (
-            supabase.table("users")
-            .update({"password_hash": new_hash})
-            .eq("id", uid)
-            .execute()
+    try:
+        await asyncio.to_thread(
+            supabase.auth.admin.update_user_by_id,
+            user["id"],
+            {"password": req.new_password},
         )
-    )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update password: {e}")
     return {"message": "Password changed successfully"}
 
 
@@ -1044,8 +899,8 @@ async def admin_list_documents(
 async def admin_list_users(user: dict = Depends(get_admin_user)):
     r = await _sb(
         lambda: (
-            supabase.table("users")
-            .select("id,email,name,role,created_at,is_verified,is_blocked")
+            supabase.table("profiles")
+            .select("id,email,name,role,created_at,is_blocked")
             .execute()
         )
     )
@@ -1175,7 +1030,7 @@ async def admin_audit_log(
 @api_router.post("/admin/users/{user_id}/block")
 async def admin_block_user(user_id: str, user: dict = Depends(get_admin_user)):
     r = await _sb(
-        lambda: supabase.table("users").select("id,email").eq("id", user_id).execute()
+        lambda: supabase.table("profiles").select("id,email").eq("id", user_id).execute()
     )
     if not r.data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1184,7 +1039,7 @@ async def admin_block_user(user_id: str, user: dict = Depends(get_admin_user)):
         raise HTTPException(status_code=400, detail="Cannot block the admin account")
     await _sb(
         lambda: (
-            supabase.table("users")
+            supabase.table("profiles")
             .update({"is_blocked": True})
             .eq("id", user_id)
             .execute()
@@ -1196,7 +1051,7 @@ async def admin_block_user(user_id: str, user: dict = Depends(get_admin_user)):
 @api_router.post("/admin/users/{user_id}/unblock")
 async def admin_unblock_user(user_id: str, user: dict = Depends(get_admin_user)):
     r = await _sb(
-        lambda: supabase.table("users").select("id").eq("id", user_id).execute()
+        lambda: supabase.table("profiles").select("id").eq("id", user_id).execute()
     )
     if not r.data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1522,7 +1377,7 @@ app.include_router(api_router)
 # ── Startup / Shutdown ─────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    # Ensure the storage bucket exists (public)
+    # Ensure storage bucket exists
     try:
         await _sb(
             lambda: supabase.storage.create_bucket(
@@ -1533,43 +1388,38 @@ async def startup():
     except Exception as e:
         logger.info(f"Storage bucket 'documents' ready (skipped create: {e})")
 
-    # Upsert admin user
-    r = await _sb(
-        lambda: supabase.table("users").select("*").eq("email", ADMIN_EMAIL).execute()
-    )
-    if not r.data:
-        await _sb(
+    # Ensure admin user exists in Supabase Auth
+    try:
+        r = await _sb(
             lambda: (
-                supabase.table("users")
-                .insert(
-                    {
-                        "email": ADMIN_EMAIL,
-                        "name": "Kovon Founders",
-                        "role": "admin",
-                        "password_hash": hash_password(ADMIN_PASSWORD),
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "is_verified": True,
-                        "is_blocked": False,
-                    }
+                supabase.table("users").select("id").eq("email", ADMIN_EMAIL).execute()
+            )
+        )
+        if not r.data:
+            auth_result = await asyncio.to_thread(
+                supabase.auth.admin.create_user,
+                {
+                    "email": ADMIN_EMAIL,
+                    "password": ADMIN_PASSWORD,
+                    "email_confirm": True,
+                    "user_metadata": {"name": "Kovon Founders"},
+                },
+            )
+            if auth_result.user:
+                uid = str(auth_result.user.id)
+                await _sb(
+                    lambda: (
+                        supabase.table("users")
+                        .update({"role": "admin", "is_verified": True})
+                        .eq("id", uid)
+                        .execute()
+                    )
                 )
-                .execute()
-            )
-        )
-        logger.info(f"Admin user created: {ADMIN_EMAIL}")
-    else:
-        existing = r.data[0]
-        updates: dict[str, Any] = {"is_verified": True, "is_blocked": False}
-        if not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
-            updates["password_hash"] = hash_password(ADMIN_PASSWORD)
-        await _sb(
-            lambda: (
-                supabase.table("users")
-                .update(updates)
-                .eq("email", ADMIN_EMAIL)
-                .execute()
-            )
-        )
-        logger.info(f"Admin user verified/updated: {ADMIN_EMAIL}")
+                logger.info(f"Admin user created: {ADMIN_EMAIL}")
+        else:
+            logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
+    except Exception as e:
+        logger.error(f"Startup admin setup error: {e}")
 
 
 @app.on_event("shutdown")
