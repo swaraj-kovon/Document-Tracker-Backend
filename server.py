@@ -33,7 +33,7 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 resend.api_key = os.environ.get("RESEND_API_KEY", "")
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8001")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 JWT_SECRET = os.environ.get("JWT_SECRET", "fallback_secret")
@@ -174,14 +174,30 @@ async def get_admin_user(request: Request) -> dict:
 
 # ── Email ──────────────────────────────────────────────────────────────────
 async def send_email(to: str, subject: str, html: str):
-    try:
-        result = await asyncio.to_thread(
-            resend.Emails.send,
-            {"from": SENDER_EMAIL, "to": [to], "subject": subject, "html": html},
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        logger.warning(
+            f"RESEND_API_KEY is not set — skipping email to {to} | subject: {subject}"
         )
-        logger.info(f"Email sent to {to}: {result}")
+        return
+
+    resend.api_key = api_key
+
+    params: resend.Emails.SendParams = {
+        "from": SENDER_EMAIL,
+        "to": [to],
+        "subject": subject,
+        "html": html,
+    }
+
+    try:
+        result = await resend.Emails.send_async(params)
+        logger.info(f"Email sent OK → {to} | id: {result.id}")
     except Exception as e:
-        logger.error(f"Failed to send email to {to}: {e}")
+        logger.error(
+            f"Email FAILED → {to} | subject: {subject} | "
+            f"sender: {SENDER_EMAIL} | error: {type(e).__name__}: {e}"
+        )
 
 
 def build_approval_email(doc: dict, approve_url: str, reject_url: str) -> str:
@@ -1457,6 +1473,46 @@ async def reject_from_email(token: str, request: Request):
             doc["title"],
         )
     )
+
+
+# ── Test Email Endpoint ────────────────────────────────────────────────────
+@api_router.post("/test-email")
+async def test_email(request: Request, user: dict = Depends(get_admin_user)):
+    """Admin-only endpoint to verify Resend email configuration."""
+    body = await request.json()
+    to = body.get("to", user["email"])
+
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=500, detail="RESEND_API_KEY is not set in environment"
+        )
+
+    html = """<!DOCTYPE html><html><body style="font-family:'Segoe UI',sans-serif;padding:40px;">
+    <div style="max-width:500px;margin:0 auto;background:white;border-radius:8px;padding:32px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <h2 style="color:#1B2A4A;margin:0 0 12px;">✅ Email is working!</h2>
+        <p style="color:#475569;">Your Resend configuration is set up correctly for Kovon Document Registry.</p>
+    </div></body></html>"""
+
+    try:
+        result = await resend.Emails.send_async(
+            {
+                "from": SENDER_EMAIL,
+                "to": [to],
+                "subject": "Kovon — Email Configuration Test",
+                "html": html,
+            }
+        )
+        return {
+            "success": True,
+            "message": f"Test email sent to {to}",
+            "email_id": result.id,
+            "sender": SENDER_EMAIL,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Email send failed: {type(e).__name__}: {e}"
+        )
 
 
 # ── Register router ────────────────────────────────────────────────────────
