@@ -1396,7 +1396,8 @@ async def startup():
             )
         )
         # Check if admin exists by email in users list
-        admin_exists = any(user['email'] == ADMIN_EMAIL for user in (r.users or []))
+        users = r if isinstance(r, list) else getattr(r, 'users', r) or []
+        admin_exists = any((user.get('email') if isinstance(user, dict) else getattr(user, 'email', None)) == ADMIN_EMAIL for user in users)
         if not admin_exists:
             auth_result = await asyncio.to_thread(
                 supabase.auth.admin.create_user,
