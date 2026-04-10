@@ -34,7 +34,7 @@ resend.api_key = os.environ.get("RESEND_API_KEY")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 BACKEND_URL = os.environ.get("BACKEND_URL")
 FRONTEND_URL = os.environ.get("FRONTEND_URL")
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET") or os.environ.get("JWT_SECRET", "")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "founders@kovon.io")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "KovonAdmin@2026")
 
@@ -128,6 +128,7 @@ async def get_current_user(request: Request) -> dict:
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
+        email = payload.get("email", "")
         r = await _sb(
             lambda: supabase.table("profiles").select("*").eq("id", user_id).execute()
         )
@@ -135,6 +136,7 @@ async def get_current_user(request: Request) -> dict:
             raise HTTPException(status_code=401, detail="User not found")
         user = r.data[0]
         user["_id"] = user["id"]
+        user["email"] = email
         if user.get("is_blocked", False):
             raise HTTPException(
                 status_code=403,
@@ -320,15 +322,20 @@ async def register(req: RegisterRequest):
     if not result.user:
         raise HTTPException(status_code=400, detail="Registration failed")
 
-    # If admin email, promote role immediately
+    # If admin email, promote role immediately in profiles table
     if email == ADMIN_EMAIL:
         uid = str(result.user.id)
-        await _sb(
-            lambda: (
-                supabase.auth.admin.update_user_by_id(uid, {"user_metadata": {"role": "admin"}})
-                .execute()
+        try:
+            await _sb(
+                lambda: (
+                    supabase.table("profiles")
+                    .update({"role": "admin"})
+                    .eq("id", uid)
+                    .execute()
+                )
             )
-        )
+        except Exception:
+            logger.warning(f"Could not set admin role for {email} during registration")
 
     return {
         "message": "Registration successful. Please check your email to verify your account.",
@@ -1377,6 +1384,14 @@ app.include_router(api_router)
 # ── Startup / Shutdown ─────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
+    if not SUPABASE_JWT_SECRET:
+        logger.error("SUPABASE_JWT_SECRET is not set — token verification will fail!")
+    elif "change_me" in SUPABASE_JWT_SECRET:
+        logger.warning(
+            "SUPABASE_JWT_SECRET looks like a placeholder — "
+            "set it to the real JWT secret from Supabase Dashboard > Project Settings > API"
+        )
+
     # Ensure storage bucket exists
     try:
         await _sb(
@@ -1397,8 +1412,13 @@ async def startup():
         )
         # Check if admin exists by email in users list
         users = r if isinstance(r, list) else getattr(r, 'users', r) or []
-        admin_exists = any((user.get('email') if isinstance(user, dict) else getattr(user, 'email', None)) == ADMIN_EMAIL for user in users)
-        if not admin_exists:
+        admin_user = None
+        for u in users:
+            u_email = u.get('email') if isinstance(u, dict) else getattr(u, 'email', None)
+            if u_email == ADMIN_EMAIL:
+                admin_user = u
+                break
+        if not admin_user:
             auth_result = await asyncio.to_thread(
                 supabase.auth.admin.create_user,
                 {
@@ -1409,11 +1429,29 @@ async def startup():
                 },
             )
             if auth_result.user:
+                admin_uid = str(auth_result.user.id)
                 logger.info(f"Admin user created: {ADMIN_EMAIL}")
             else:
+                admin_uid = None
                 logger.warning(f"Failed to create admin user: {ADMIN_EMAIL}")
         else:
+            admin_uid = str(admin_user.get('id') if isinstance(admin_user, dict) else getattr(admin_user, 'id', None))
             logger.info(f"Admin user already exists: {ADMIN_EMAIL}")
+
+        # Ensure admin profile has role='admin' and email set in the profiles table
+        if admin_uid:
+            try:
+                await _sb(
+                    lambda: (
+                        supabase.table("profiles")
+                        .update({"role": "admin", "email": ADMIN_EMAIL})
+                        .eq("id", admin_uid)
+                        .execute()
+                    )
+                )
+                logger.info(f"Admin profile role set to 'admin' for {ADMIN_EMAIL}")
+            except Exception as e2:
+                logger.error(f"Failed to update admin profile role: {e2}")
     except Exception as e:
         logger.error(f"Startup admin setup error: {e}")
 
